@@ -13,22 +13,31 @@
 #include <sys/types.h>
 #include <sys/dispatch.h>
 #include <sys/neutrino.h>
-#include "fleet_common.h"
-static uint64_t get_time_ms(void);
-#define MANAGER_TIMER_PULSE 10 // manager configuration
+#include "fleet_common.h" // both rovers and manager must share the same definitions and layout
+#include "fleet_watchdog_client.h"
+#define MANAGER_TIMER_PULSE 10 // configuration
 #define MANAGER_TIMER_MS 1000
 #define MAX_MESSAGE_AGE_MS 3000ULL
-#define ROBOT1_INDEX 0
-#define ROBOT2_INDEX 1
+#define ROBOT_COUNT_LOCAL 2
 #define MANAGER_PRIORITY 20
 #define ROBOT_EXECUTABLE "/tmp/robot_bin/rover"
-static timer_t manager_timer; // global timer and ipc variables
+#define MAX_SEGMENTS 10
+#define MAX_WAITING_ROBOTS ROBOT_COUNT
+#define MANAGER_SAFETY_NORMAL 0 // manager-specific safety states kept separate from rover watchdog
+#define MANAGER_SAFETY_DEGRADED 1
+#define MANAGER_SAFETY_SAFE_STOP 2
+#define MANAGER_SAFETY_RECOVERY 3
+#define MANAGER_SAFETY_EMERGENCY_STOP 4
+static timer_t manager_timer; // global variables
 static int manager_coid = -1;
 static int timer_initialized = 0;
 static pthread_mutex_t robot_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int fleet_safety_state = SAFETY_NORMAL; // central safety manager
+static pthread_mutex_t reservation_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int fw_manager_coid = -1; // fleet watchdog client connection
+static uint32_t fw_manager_sequence = 0;
+static int fleet_safety_state = MANAGER_SAFETY_NORMAL; // fleet safety information
 static int emergency_stop_active = 0;
-typedef struct { // robot state info
+typedef struct { // robot state structure
     int active;
     int seen;
     uint32_t last_sequence;
@@ -37,14 +46,12 @@ typedef struct { // robot state info
     uint64_t last_timestamp_ms;
     uint64_t last_receive_ms;
 } robot_state;
-static robot_state robots[2] = {0};
-#define MAX_SEGMENTS 10 // shared segment reservation table
-typedef struct { // priority-based waiting request
+static robot_state robots[ROBOT_COUNT_LOCAL] = {0};
+typedef struct { // segment reservation structures
     int robot_id;
     int priority;
     uint64_t request_timestamp_ms;
 } waiting_request;
-#define MAX_WAITING_ROBOTS ROBOT_COUNT // shared segment reservation
 typedef struct {
     int segment_id;
     int state;
@@ -53,39 +60,55 @@ typedef struct {
     waiting_request waiting_queue[MAX_WAITING_ROBOTS];
 } segment_reservation;
 static segment_reservation reservation_table[MAX_SEGMENTS];
-static pthread_mutex_t reservation_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t get_time_ms(void) { // time function
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1) {
+        perror("clock_gettime");
+        return 0;
+    }
+    return ((uint64_t)ts.tv_sec * 1000ULL) + ((uint64_t)ts.tv_nsec / 1000000ULL);
+}
 static void initialize_reservation_table(void) { // initialize reservation table
-    for (int i = 0; i < MAX_SEGMENTS; i++) {
+    int i, j;
+    for (i = 0; i < MAX_SEGMENTS; i++) {
         reservation_table[i].segment_id = -1;
         reservation_table[i].state = SEGMENT_FREE;
         reservation_table[i].owner_robot_id = 0;
         reservation_table[i].waiter_count = 0;
-        for (int j = 0; j < MAX_WAITING_ROBOTS; j++) {
+        for (j = 0; j < MAX_WAITING_ROBOTS; j++) {
             reservation_table[i].waiting_queue[j].robot_id = 0;
             reservation_table[i].waiting_queue[j].priority = 0;
             reservation_table[i].waiting_queue[j].request_timestamp_ms = 0;
         }
     }
-    printf("[RESERVATION] Priority queue initialized\n");
+    printf("[RESERVATION] Reservation table initialized\n");
 }
-static int request_segment_reservation(int robot_id, int segment_id, int priority) { // priority-based reservation request
+static int find_segment_slot(int segment_id) { // find segment slot
+    int i;
+    for (i = 0; i < MAX_SEGMENTS; i++) {
+        if (reservation_table[i].segment_id == segment_id) return i;
+    }
+    return -1;
+}
+static int request_segment_reservation(int robot_id, int segment_id, int priority) { // returns 1 if granted, 0 if queued, -1 if invalid or full
     uint64_t request_time = get_time_ms();
+    int slot = -1;
+    int free_slot = -1;
+    int i;
     if ((robot_id != 1 && robot_id != 2) || segment_id <= 0 || priority < 0 || request_time == 0) {
         return -1;
     }
     pthread_mutex_lock(&reservation_mutex);
-    int slot = -1;
-    int free_slot = -1;
-    for (int i = 0; i < MAX_SEGMENTS; i++) { // find existing segment or unused slot
+    for (i = 0; i < MAX_SEGMENTS; i++) { // search for existing segment or free slot
         if (reservation_table[i].segment_id == segment_id) {
             slot = i;
             break;
         }
-        if (reservation_table[i].state == SEGMENT_FREE && reservation_table[i].owner_robot_id == 0 && reservation_table[i].waiter_count == 0 && free_slot == -1) {
+        if (reservation_table[i].segment_id == -1 && reservation_table[i].owner_robot_id == 0 && reservation_table[i].waiter_count == 0 && free_slot == -1) {
             free_slot = i;
         }
     }
-    if (slot == -1) { // create a new segment entry
+    if (slot == -1) { // create new segment entry
         if (free_slot == -1) {
             pthread_mutex_unlock(&reservation_mutex);
             return -1;
@@ -97,33 +120,33 @@ static int request_segment_reservation(int robot_id, int segment_id, int priorit
         reservation_table[slot].waiter_count = 0;
     }
     segment_reservation *segment = &reservation_table[slot];
-    if (segment->owner_robot_id == robot_id) { // existing owner retains ownership
+    if (segment->owner_robot_id == robot_id) { // existing owner retains reservation
         pthread_mutex_unlock(&reservation_mutex);
         return 1;
     }
-    for (int i = 0; i < segment->waiter_count; i++) { // already waiting, preserve original timestamp
+    for (i = 0; i < segment->waiter_count; i++) { // avoid duplicate waiting entries
         if (segment->waiting_queue[i].robot_id == robot_id) {
             pthread_mutex_unlock(&reservation_mutex);
             return 0;
         }
     }
-    if (segment->state == SEGMENT_FREE && segment->owner_robot_id == 0 && segment->waiter_count == 0) { // segment free, grant immediately if no queue
+    if (segment->state == SEGMENT_FREE && segment->owner_robot_id == 0 && segment->waiter_count == 0) { // grant immediately if free
         segment->owner_robot_id = robot_id;
         segment->state = SEGMENT_RESERVED;
         printf("[RESERVATION] Segment %d granted to Robot %d\n", segment_id, robot_id);
         pthread_mutex_unlock(&reservation_mutex);
         return 1;
     }
-    if (segment->waiter_count >= MAX_WAITING_ROBOTS) { // add request to waiting queue
+    if (segment->waiter_count >= MAX_WAITING_ROBOTS) { // check waiting queue capacity
         pthread_mutex_unlock(&reservation_mutex);
         return -1;
     }
-    int pos = segment->waiter_count;
+    int pos = segment->waiter_count; // add robot to waiting queue
     segment->waiting_queue[pos].robot_id = robot_id;
     segment->waiting_queue[pos].priority = priority;
     segment->waiting_queue[pos].request_timestamp_ms = request_time;
     segment->waiter_count++;
-    for (int i = segment->waiter_count - 1; i > 0; i--) { // sort higher priority first, earlier timestamp first
+    for (i = segment->waiter_count - 1; i > 0; i--) { // sort by higher priority first, then earlier timestamp on ties
         waiting_request *current = &segment->waiting_queue[i];
         waiting_request *previous = &segment->waiting_queue[i - 1];
         int should_swap = (current->priority > previous->priority) || (current->priority == previous->priority && current->request_timestamp_ms < previous->request_timestamp_ms);
@@ -132,25 +155,51 @@ static int request_segment_reservation(int robot_id, int segment_id, int priorit
         *current = *previous;
         *previous = temp;
     }
-    printf("[RESERVATION] Robot %d queued for Segment %d | Priority: %d\n", robot_id, segment_id, priority);
-    printf("[RESERVATION] Queue position: %d\n", pos + 1);
+    printf("[RESERVATION] Robot %d queued for Segment %d\n", robot_id, segment_id);
     pthread_mutex_unlock(&reservation_mutex);
     return 0;
 }
-static uint64_t get_time_ms(void) { // monotonic clock in ms
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1) {
-        perror("clock_gettime");
-        return 0;
+static void process_segment_status(const robot_message *msg) { // release segment when owner reports clear and promote next queued robot
+    int slot;
+    int j;
+    if (msg->segment_id <= 0) return;
+    pthread_mutex_lock(&reservation_mutex);
+    slot = find_segment_slot(msg->segment_id);
+    if (slot < 0) {
+        pthread_mutex_unlock(&reservation_mutex);
+        return;
     }
-    return ((uint64_t)ts.tv_sec * 1000ULL) + ((uint64_t)ts.tv_nsec / 1000000ULL);
+    segment_reservation *seg = &reservation_table[slot];
+    if (msg->segment_occupied && seg->owner_robot_id == msg->robot_id) { // only the owner can mark its segment occupied
+        seg->state = SEGMENT_OCCUPIED;
+        printf("[RESERVATION] Robot %d occupies Segment %d\n", msg->robot_id, msg->segment_id);
+    }
+    if (msg->segment_clear && seg->owner_robot_id == msg->robot_id) { // only the owner can release its segment
+        printf("[RESERVATION] Robot %d cleared Segment %d\n", msg->robot_id, msg->segment_id);
+        seg->owner_robot_id = 0;
+        seg->state = SEGMENT_FREE;
+        if (seg->waiter_count > 0) { // promote next waiting robot
+            waiting_request next = seg->waiting_queue[0];
+            for (j = 1; j < seg->waiter_count; j++) {
+                seg->waiting_queue[j - 1] = seg->waiting_queue[j];
+            }
+            seg->waiter_count--;
+            seg->owner_robot_id = next.robot_id;
+            seg->state = SEGMENT_RESERVED;
+            printf("[RESERVATION] Segment %d promoted to Robot %d\n", msg->segment_id, next.robot_id);
+        } else {
+            seg->segment_id = -1;
+            seg->state = SEGMENT_FREE;
+        }
+    }
+    pthread_mutex_unlock(&reservation_mutex);
 }
-static void set_fleet_safety_state(int new_state) { // central safety state manager
-    if (new_state < SAFETY_NORMAL || new_state > SAFETY_EMERGENCY_STOP) {
+static void set_fleet_safety_state(int new_state) { // fleet safety state manager
+    if (new_state < MANAGER_SAFETY_NORMAL || new_state > MANAGER_SAFETY_EMERGENCY_STOP) {
         printf("[SAFETY] Invalid state requested\n");
         return;
     }
-    if (emergency_stop_active && new_state != SAFETY_EMERGENCY_STOP) { // emergency stop cannot be cleared automatically
+    if (emergency_stop_active && new_state != MANAGER_SAFETY_EMERGENCY_STOP) { // emergency stop cannot be cleared automatically
         printf("[SAFETY] Emergency stop is latched\n");
         return;
     }
@@ -160,19 +209,19 @@ static void set_fleet_safety_state(int new_state) { // central safety state mana
     printf("New State: %d\n", new_state);
     fleet_safety_state = new_state;
     switch (fleet_safety_state) {
-        case SAFETY_NORMAL:
+        case MANAGER_SAFETY_NORMAL:
             printf("[SAFETY] Fleet operating normally\n");
             break;
-        case SAFETY_DEGRADED:
+        case MANAGER_SAFETY_DEGRADED:
             printf("[SAFETY] Restricted operation\n");
             break;
-        case SAFETY_SAFE_STOP:
+        case MANAGER_SAFETY_SAFE_STOP:
             printf("[SAFETY] SAFE STOP ACTIVATED\n");
             break;
-        case SAFETY_RECOVERY:
+        case MANAGER_SAFETY_RECOVERY:
             printf("[SAFETY] Recovery in progress\n");
             break;
-        case SAFETY_EMERGENCY_STOP:
+        case MANAGER_SAFETY_EMERGENCY_STOP:
             emergency_stop_active = 1;
             printf("[SAFETY] EMERGENCY STOP LATCHED\n");
             break;
@@ -205,8 +254,8 @@ static int initialize_manager_timer(int chid) { // initialize periodic manager t
         return -1;
     }
     memset(&timer_spec, 0, sizeof(timer_spec));
-    timer_spec.nsec = 1000000000ULL;
-    timer_spec.interval_nsec = 1000000000ULL;
+    timer_spec.nsec = (long long)MANAGER_TIMER_MS * 1000000LL;
+    timer_spec.interval_nsec = (long long)MANAGER_TIMER_MS * 1000000LL;
     if (TimerSettime(manager_timer, 0, &timer_spec, NULL) == -1) {
         perror("Manager TimerSettime failed");
         TimerDestroy(manager_timer);
@@ -230,7 +279,7 @@ static int validate_message(const robot_message *msg) { // message validation
 }
 static int validate_freshness(const robot_message *msg, const robot_state *state, uint64_t now) { // message freshness validation
     if (!state->seen) return 1; // first report from this rover
-    if (msg->sequence <= state->last_sequence) return 0; // reject duplicate or out of order sequence
+    if (msg->sequence <= state->last_sequence) return 0; // reject duplicate or out-of-order sequence
     if (msg->heartbeat_count <= state->last_heartbeat) return 0; // reject duplicate or decreasing heartbeat
     if (msg->timestamp_ms <= state->last_timestamp_ms) return 0; // reject old or decreasing timestamp
     if (msg->timestamp_ms > now) return 0; // reject future timestamps
@@ -251,9 +300,11 @@ static void update_robot_state(const robot_message *msg, uint64_t receive_time) 
 }
 static void check_heartbeats(void) { // heartbeat monitoring
     uint64_t now = get_time_ms();
+    int timeout_detected = 0;
+    int i;
     if (now == 0) return;
     pthread_mutex_lock(&robot_mutex);
-    for (int i = 0; i < 2; i++) {
+    for (i = 0; i < ROBOT_COUNT_LOCAL; i++) {
         if (!robots[i].active) continue;
         uint64_t elapsed = now - robots[i].last_receive_ms;
         if (elapsed > HEARTBEAT_TIMEOUT_MS) {
@@ -261,43 +312,47 @@ static void check_heartbeats(void) { // heartbeat monitoring
             printf("No report received for %llu ms\n", (unsigned long long)elapsed);
             robots[i].active = 0;
             robots[i].status = STATUS_STOPPED;
-            set_fleet_safety_state(SAFETY_SAFE_STOP);
+            timeout_detected = 1;
         } else {
             printf("[HEARTBEAT] Robot %d | Sequence: %u | Status: %d\n", i + 1, robots[i].last_sequence, robots[i].status);
         }
     }
     pthread_mutex_unlock(&robot_mutex);
+    if (timeout_detected) { // avoid triggering safety state transition while holding robot_mutex
+        set_fleet_safety_state(MANAGER_SAFETY_SAFE_STOP);
+    }
 }
-static robot_reply make_initial_decision(const robot_message *msg) { // safety-aware reservation decision
+static robot_reply make_initial_decision(const robot_message *msg) { // fleet manager decision engine
     robot_reply reply = {0};
+    int result;
     reply.segment_id = msg->segment_id;
     reply.reservation_granted = 0;
-    if (fleet_safety_state == SAFETY_EMERGENCY_STOP) { // emergency stop has highest precedence
+    if (fleet_safety_state == MANAGER_SAFETY_EMERGENCY_STOP) { // emergency stop has highest precedence
         reply.command = CMD_STOP;
         reply.reason = REASON_INVALID_REQUEST;
         return reply;
     }
-    if (fleet_safety_state == SAFETY_SAFE_STOP || fleet_safety_state == SAFETY_RECOVERY) { // fleet safe stop
+    if (fleet_safety_state == MANAGER_SAFETY_SAFE_STOP || fleet_safety_state == MANAGER_SAFETY_RECOVERY) { // safe stop and recovery prohibit movement
         reply.command = CMD_STOP;
         reply.reason = REASON_HEARTBEAT_TIMEOUT;
         return reply;
     }
-    int result = request_segment_reservation(msg->robot_id, msg->segment_id, msg->priority); // request segment reservation and update occupancy
-    if (result == -1) { // invalid request or queue full
+    result = request_segment_reservation(msg->robot_id, msg->segment_id, msg->priority); // request shared segment reservation before allowing movement
+    if (result == -1) {
         reply.command = CMD_STOP;
         reply.reason = REASON_INVALID_REQUEST;
         return reply;
     }
-    if (result == 0) { // reservation not yet available
+    if (result == 0) {
         reply.command = CMD_STOP;
         reply.reason = REASON_CONFLICT;
         printf("[MANAGER] Robot %d waiting for Segment %d\n", msg->robot_id, msg->segment_id);
         return reply;
     }
-    reply.reservation_granted = 1; // reservation granted
+    reply.reservation_granted = 1;
     reply.command = CMD_MOVE;
     reply.reason = REASON_CLEAR;
-    if (fleet_safety_state == SAFETY_DEGRADED) { // degraded mode permits reservation but moves slowly
+    if (fleet_safety_state == MANAGER_SAFETY_DEGRADED) { // degraded state permits slow movement only
         reply.command = CMD_SLOW;
         reply.reason = REASON_UNSAFE_DISTANCE;
     }
@@ -316,7 +371,10 @@ static void cleanup_manager(name_attach_t *attach, pid_t robot1_pid, pid_t robot
         manager_coid = -1;
     }
     if (attach != NULL) name_detach(attach, 0);
-    pthread_mutex_destroy(&robot_mutex);
+    if (fw_manager_coid != -1) {
+        fw_client_close(fw_manager_coid);
+        fw_manager_coid = -1;
+    }
 }
 int main(void) { // main fleet manager
     name_attach_t *attach = NULL;
@@ -324,11 +382,11 @@ int main(void) { // main fleet manager
     pid_t robot1_pid = -1;
     pid_t robot2_pid = -1;
     printf("\n====================================\n");
-    printf("     FLEETSHIELD MANAGER STARTED\n");
+    printf("       FLEETSHIELD MANAGER\n");
     printf("====================================\n");
     memset(robots, 0, sizeof(robots));
     initialize_reservation_table();
-    fleet_safety_state = SAFETY_NORMAL;
+    fleet_safety_state = MANAGER_SAFETY_NORMAL;
     emergency_stop_active = 0;
     printf("[SAFETY] Initial state: NORMAL\n");
     attach = name_attach(NULL, SERVER_NAME, 0); // register manager server
@@ -338,8 +396,15 @@ int main(void) { // main fleet manager
     }
     printf("[MANAGER] Server registered: %s\n", SERVER_NAME);
     printf("[MANAGER] Channel ID: %d\n", attach->chid);
+    fw_manager_coid = fw_client_init(); // connect to fleet watchdog
+    if (fw_manager_coid == -1) {
+        perror("Fleet Watchdog connection failed");
+        cleanup_manager(attach, -1, -1);
+        return EXIT_FAILURE;
+    }
+    printf("[FLEET WATCHDOG] Client connected\n");
     configure_manager_priority(); // configure manager priority
-    if (initialize_manager_timer(attach->chid) == -1) { // initialize periodic timer
+    if (initialize_manager_timer(attach->chid) == -1) { // initialize manager timer
         cleanup_manager(attach, -1, -1);
         return EXIT_FAILURE;
     }
@@ -361,7 +426,7 @@ int main(void) { // main fleet manager
         return EXIT_FAILURE;
     }
     printf("[MANAGER] Robot 2 started | PID: %ld\n", (long)robot2_pid);
-    printf("\n[MANAGER] Both Rovers launched successfully!\n");
+    printf("\n[MANAGER] Both Rovers launched\n");
     printf("[MANAGER] Waiting for Rover messages...\n");
     while (1) { // main message receiving loop
         union {
@@ -377,11 +442,15 @@ int main(void) { // main fleet manager
         if (rcvid == 0) { // handle timer pulse
             if (received.pulse.code == MANAGER_TIMER_PULSE) {
                 printf("\n[MANAGER TIMER] Monitoring event\n");
-                check_heartbeats();
+                check_heartbeats(); // monitor rover heartbeats
+                if (fw_client_heartbeat(fw_manager_coid, FW_ROLE_MANAGER, ++fw_manager_sequence) != FW_ACK_OK) { // send manager heartbeat to fleet watchdog
+                    printf("[MANAGER] Fleet Watchdog heartbeat failed\n");
+                    set_fleet_safety_state(MANAGER_SAFETY_SAFE_STOP);
+                }
             }
             continue;
         }
-        robot_message msg = received.message; // copy received message without using a global variable
+        robot_message msg = received.message; // copy received message
         if (!validate_message(&msg)) { // validate message format
             printf("[MANAGER] Invalid message received\n");
             MsgError(rcvid, EINVAL);
@@ -409,7 +478,8 @@ int main(void) { // main fleet manager
             continue;
         }
         update_robot_state(&msg, get_time_ms()); // update robot state
-        printf("\n====================================\n"); // display robot info
+        process_segment_status(&msg); // process segment status
+        printf("\n====================================\n"); // display robot information
         printf("ROBOT %d REPORT RECEIVED\n", msg.robot_id);
         printf("Position: X = %.2f, Y = %.2f\n", msg.current_x, msg.current_y);
         printf("Destination: X = %.2f, Y = %.2f\n", msg.destination_x, msg.destination_y);
@@ -422,7 +492,7 @@ int main(void) { // main fleet manager
         printf("Sequence: %u\n", msg.sequence);
         printf("Heartbeat: %u\n", msg.heartbeat_count);
         printf("Timestamp: %llu\n", (unsigned long long)msg.timestamp_ms);
-        robot_reply reply = make_initial_decision(&msg); // make manager decision
+        robot_reply reply = make_initial_decision(&msg); // make fleet manager decision
         if (MsgReply(rcvid, EOK, &reply, sizeof(reply)) == -1) { // send reply to rover
             perror("MsgReply failed");
             break;
@@ -431,5 +501,7 @@ int main(void) { // main fleet manager
     }
     printf("\n[MANAGER] Shutting down...\n"); // cleanup
     cleanup_manager(attach, robot1_pid, robot2_pid);
+    pthread_mutex_destroy(&robot_mutex);
+    pthread_mutex_destroy(&reservation_mutex);
     return EXIT_SUCCESS;
 }
